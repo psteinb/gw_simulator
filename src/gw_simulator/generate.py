@@ -11,6 +11,7 @@ import hdf5plugin
 import numpy as np
 import torch
 from torch import multiprocessing
+import bilby
 
 from gw_simulator.simulator.interface import \
     BilbyGravitationalWaveBenchmarkSimulator as gws
