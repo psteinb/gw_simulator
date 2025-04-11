@@ -6,14 +6,15 @@ readme = "README.md"
 authors = [
     { name = "Peter Steinbach", email = "p.steinbach@hzdr.de" }
 ]
-requires-python = "<3.12" #see https://github.com/ahnitz/ligo-segments/issues/1
+requires-python = "<3.13" #see https://github.com/ahnitz/ligo-segments/issues/1 and https://github.com/gwastro/pycbc/blob/9c44fd093f834f2df18cdc6bad62c224ab6a5b1f/setup.py#L268
 dependencies = [
 "h5py", #io
 "hdf5plugin", #compression in hdf5
-"PyCBC>2.7", #simulator framework
 "torch", #simulator framework
 "loguru", #CLI goodness
-"click" #CLI helper
+"click", #CLI helper
+"bilby",
+"lalsuite"
 ]
 include-package-data = true
 

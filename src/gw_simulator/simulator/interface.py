@@ -6,21 +6,9 @@ The problem dimensionality of the inputs therefore reduces to 2.
 Inspired by https://github.com/timothygebhard/ggwd
 """
 
-import os
-
-import numpy as np
-import pycbc
+import bilby
 import torch
-from lal import LIGOTimeGPS
-from pycbc.detector import Detector
-from pycbc.distributions import (JointDistribution,
-                                 read_constraints_from_config,
-                                 read_distributions_from_config,
-                                 read_params_from_config)
-from pycbc.noise import noise_from_psd
-from pycbc.psd import aLIGOZeroDetHighPower
-from pycbc.waveform import get_td_waveform
-from pycbc.workflow import WorkflowConfigParser
+
 
 class BaseSimulator:
     r"""Base simulator class.
@@ -78,143 +66,144 @@ class BaseSimulator:
         pass
 
 
-class GravitationalWaveBenchmarkSimulator(BaseSimulator):
-    r"""Simulation model associated with the gravitational waves benchmark.
-
-    Marginalizes over the mass parameters. The dimensionality of the
-    problem is therefore reduces to 2.
+class BilbyGravitationalWaveBenchmarkSimulator(BaseSimulator):
     """
+    Simulator model for gravitational waves using Bilby.
+    Returns separate outputs for:
+      - detector frame strains (i.e. the injected gravitational wave signal in the detector, with zero noise)
+      - noise strains (the noise realization used)
+    Both are provided in time and frequency domains.
+    """
+    def __init__(self,
+                 duration=4.0,
+                 sampling_frequency=2048,
+                 ifo_names=['H1', 'L1', 'V1'],
+                 waveform_approximant='IMRPhenomPv2'):
+        self.duration = duration
+        self.sampling_frequency = sampling_frequency
+        self.ifo_names = ifo_names
+        self.waveform_approximant = waveform_approximant
 
-    def __init__(
-        self,
-        config_file=os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "config_file.ini"
-        ),
-    ):
-        super(GravitationalWaveBenchmarkSimulator, self).__init__()
-
-        workflow_config_parser = WorkflowConfigParser(configFiles=[config_file])
-        self.variable_arguments, self.static_arguments = read_params_from_config(
-            workflow_config_parser
+        # Set up default waveform arguments (adjust as needed)
+        self.waveform_arguments = dict(
+            waveform_approximant=self.waveform_approximant,
+            reference_frequency=20.0,
+            minimum_frequency=20.0
         )
-        dist = read_distributions_from_config(workflow_config_parser)
-        self.pval = JointDistribution(self.variable_arguments, *dist)
+
+        # Create a Bilby waveform generator using the LAL binary black hole source model
+        self.waveform_generator = bilby.gw.waveform_generator.WaveformGenerator(
+            duration=self.duration,
+            sampling_frequency=self.sampling_frequency,
+            frequency_domain_source_model=bilby.gw.source.lal_binary_black_hole,
+            parameter_conversion=bilby.gw.conversion.convert_to_lal_binary_black_hole_parameters,
+            waveform_arguments=self.waveform_arguments
+        )
+
+        # Default geocentric time for injections.
+        self.merger_time = 1126259462.4
+        # Offset so that the merger is not at the very beginning of the time series.
+        self.start_offset = 3.0
 
     def _simulate_gw(self, mass1, mass2):
-        param_values = self.pval.rvs()[0]
-        params = dict(zip(self.variable_arguments, param_values))
-        params["mass1"] = mass1
-        params["mass2"] = mass2
+        # Set up injection parameters (modify as needed)
+        parameters = {
+            'mass_1': float(mass1),
+            'mass_2': float(mass2),
+            'luminosity_distance': 400.0,  # in Mpc
+            'theta_jn': 0.4,              # inclination angle (radians)
+            'phase': 0.0,
+            'geocent_time': self.merger_time,
+            'ra': 1.95,
+            'dec': -1.2,
+            'psi': 0.0,
+            'a_1': 0.0,
+            'a_2': 0.0,
+            'tilt_1': 0.0,
+            'tilt_2': 0.0,
+        }
 
-        td_length = int(
-            self.static_arguments["waveform_length"]
-            * self.static_arguments["sampling_rate"]
-        )
-        delta_t = 1.0 / self.static_arguments["sampling_rate"]
-        fd_length = int(td_length / 2.0 + 1)
-        delta_f = 1.0 / self.static_arguments["waveform_length"]
-        event_time = self.static_arguments["seconds_before_event"]
+        # Create interferometers.
+        ifos = bilby.gw.detector.InterferometerList(self.ifo_names)
 
-        h_plus, h_cross = get_td_waveform(
-            approximant=self.static_arguments["approximant"],
-            delta_t=delta_t,
-            delta_f=delta_f,
-            f_lower=self.static_arguments["f_lower"],
-            coa_phase=params["coa_phase"],
-            distance=params["distance"],
-            inclination=params["inclination"],
-            mass1=params["mass1"],
-            mass2=params["mass2"],
-            spin1z=params["spin1z"],
-            spin2z=params["spin2z"],
-        )
-
-        h_plus.resize(td_length)
-        h_cross.resize(td_length)
-
-        detectors = {"H1": Detector("H1"), "L1": Detector("L1")}
-        signals = {}
-
-        for detector_name in ("H1", "L1"):
-
-            detector = detectors[detector_name]
-
-            f_plus, f_cross = detector.antenna_pattern(
-                right_ascension=self.static_arguments["ra"],#params["ra"],
-                declination=self.static_arguments["dec"],#params["dec"],
-                polarization=self.static_arguments["polarization"],#params["polarization"],
-                t_gps=100,
+        # First, set the strain data from the PSD to generate a noise realization.
+        # Store the noise separately for each interferometer.
+        noise_data = {}
+        for ifo in ifos:
+            ifo.set_strain_data_from_power_spectral_density(
+                sampling_frequency=self.sampling_frequency,
+                duration=self.duration,
+                start_time=self.merger_time - self.start_offset
             )
+            # Copy the noise realization in both time and frequency domains.
+            noise_td = ifo.strain_data.time_domain_strain.copy()
+            noise_fd = ifo.strain_data.frequency_domain_strain.copy()
+            noise_data[ifo.name] = {"td": noise_td, "fd": noise_fd}
 
-            delta_t_h1 = detector.time_delay_from_detector(
-                other_detector=detectors["H1"],
-                right_ascension=self.static_arguments["ra"],#params["ra"],
-                declination=self.static_arguments["dec"],#params["dec"],
-                t_gps=100,
-            )
+        # Now inject the gravitational wave signal into the interferometers.
+        ifos.inject_signal(parameters=parameters, waveform_generator=self.waveform_generator)
 
-            signal = f_plus * h_plus + f_cross * h_cross
+        # Retrieve the full (signal + noise) data and compute the pure signal (detector frame strain).
+        strains = {}
+        for ifo in ifos:
+            full_td = ifo.strain_data.time_domain_strain
+            full_fd = ifo.strain_data.frequency_domain_strain
+            # Compute the pure injected signal by subtracting the noise realization.
+            signal_td = full_td - noise_data[ifo.name]["td"]
+            signal_fd = full_fd - noise_data[ifo.name]["fd"]
+            strains[ifo.name] = {
+                "detector": {"td": signal_td, "fd": signal_fd},
+                "noise": {"td": noise_data[ifo.name]["td"], "fd": noise_data[ifo.name]["fd"]},
+                "full": {"td": full_td, "fd": full_fd}  # full = detector + noise
+            }
+        return strains
 
-            offset = 100 + delta_t_h1 + signal.start_time
-            signal = signal.cyclic_time_shift(offset)
-            signal.start_time = event_time - 100
-
-            signals[detector_name] = signal
-
-        psd = aLIGOZeroDetHighPower(
-            length=fd_length,
-            delta_f=delta_f,
-            low_freq_cutoff=self.static_arguments["f_lower"],
-        )
-        noise_length = int(
-            self.static_arguments["noise_interval_width"]
-            * self.static_arguments["sampling_rate"]
-        )
-        start_time = event_time - self.static_arguments["noise_interval_width"] / 2
-
-        noise = {}
-        for det in ("H1", "L1"):
-            noise[det] = noise_from_psd(length=noise_length, delta_t=delta_t, psd=psd)
-            noise[det]._epoch = LIGOTimeGPS(start_time)
-
-        strain = {}
-
-        for det in ("H1", "L1"):
-            strain[det] = noise[det].add_into(signals[det])
-
-        for det in ("H1", "L1"):
-            strain[det] = strain[det].whiten(
-                segment_duration=self.static_arguments["whitening_segment_duration"],
-                max_filter_duration=self.static_arguments[
-                    "whitening_max_filter_duration"
-                ],
-                remove_corrupted=False,
-            )
-
-            strain[det] = strain[det].highpass_fir(
-                frequency=self.static_arguments["bandpass_lower"],
-                remove_corrupted=False,
-                order=512,
-            )
-
-        a = event_time - self.static_arguments["seconds_before_event"]
-        b = event_time + self.static_arguments["seconds_after_event"]
-
-        for det in ("H1", "L1"):
-            strain[det] = strain[det].time_slice(a, b)
-
-        return strain["H1"], strain["L1"]
-
-    @torch.no_grad()
     def forward(self, inputs, **kwargs):
-        samples = []
+        """
+        Simulate gravitational wave signals for a batch of mass parameters.
 
-        inputs = inputs.view(-1, 2)
-        for input in inputs:
-            h1, l1 = self._simulate_gw(input[0], input[1])
-            h1 = torch.tensor(h1)
-            l1 = torch.tensor(l1)
-            x_out = torch.stack([h1, l1], 0)
-            samples.append(x_out)
+        Args:
+            inputs (torch.Tensor): A tensor of shape (batch_size, 2) containing mass parameters.
 
-        return torch.stack(samples, dim=0)
+        Returns:
+            dict: A dictionary with two keys ('detector' and 'noise'), each mapping to a sub-dictionary:
+                  - "time": tensor of shape (batch_size, N_ifos, T_td)
+                  - "frequency": tensor of shape (batch_size, N_ifos, T_fd)
+        """
+        batch_detector_td = []
+        batch_detector_fd = []
+        batch_noise_td = []
+        batch_noise_fd = []
+
+        # Loop over each sample in the batch.
+        for mass_pair in inputs.view(-1, 2):
+            strains = self._simulate_gw(mass_pair[0].item(), mass_pair[1].item())
+            detector_td_list = []
+            detector_fd_list = []
+            noise_td_list = []
+            noise_fd_list = []
+            # Ensure ordering of interferometers follows self.ifo_names.
+            for name in self.ifo_names:
+                detector_td_list.append(torch.tensor(strains[name]["detector"]["td"]))
+                detector_fd_list.append(torch.tensor(strains[name]["detector"]["fd"]))
+                noise_td_list.append(torch.tensor(strains[name]["noise"]["td"]))
+                noise_fd_list.append(torch.tensor(strains[name]["noise"]["fd"]))
+            batch_detector_td.append(torch.stack(detector_td_list, dim=0))
+            batch_detector_fd.append(torch.stack(detector_fd_list, dim=0))
+            batch_noise_td.append(torch.stack(noise_td_list, dim=0))
+            batch_noise_fd.append(torch.stack(noise_fd_list, dim=0))
+
+        return {
+            "detector": {
+                "time": torch.stack(batch_detector_td, dim=0),
+                "frequency": torch.stack(batch_detector_fd, dim=0)
+            },
+            "noise": {
+                "time": torch.stack(batch_noise_td, dim=0),
+                "frequency": torch.stack(batch_noise_fd, dim=0)
+            }
+        }
+
+    def terminate(self):
+        # Cleanup if needed.
+        pass

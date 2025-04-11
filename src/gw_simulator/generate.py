@@ -9,45 +9,33 @@ import click
 import h5py
 import hdf5plugin
 import numpy as np
-import pycbc
 import torch
 from torch import multiprocessing
 
 from gw_simulator.simulator.interface import \
-    GravitationalWaveBenchmarkSimulator as gws
-from gw_simulator.utils import get_git_describe
+    BilbyGravitationalWaveBenchmarkSimulator as gws
 
-pycbc_semver = pycbc.__version__.split(".")
+#from gw_simulator.utils import get_git_describe
 
-## DEFAULT VALUES
-
+## DEFAULT VALUES ###############################
+# legacy settings
 if "NUM_SIMS" not in os.environ.keys():
     NUM_SIMS = 10_000
 else:
     NUM_SIMS = int(os.environ["NUM_SIMS"])
 
-ROOTFOLDER = Path(__file__).resolve().parent
+DEFAULT_SIMULATOR = gws()
 
-config_path = ROOTFOLDER / "config/pycbc_config.ini"
-
-print(f"using config file {config_path} for GWS simulator")
-
-with open(config_path, "r") as cfile:
-    config_content_str = cfile.read()
-
-default_simulator = gws(str(config_path))
 # TODO: meta data for identifying the simulation (failed if not run in a git repo)
 # GIT_DESCRIPTION = get_git_describe()
 
 
-def run_sim(theta: torch.Tensor, simulator: gws = default_simulator) -> torch.Tensor:
+def run_sim(theta: torch.Tensor,
+            simulator: gws = DEFAULT_SIMULATOR,
+            domain: str = "time") -> torch.Tensor:
     """
     Perform one simulation given simulator object and the simulator parameters
     theta. The thetas encode the mass of the blackhole (index 0 in last dimension).
-    Entry at index 1 of theta's last dimension corresponds to the fraction of
-    mass 0 which results in the mass of black whole 1. In other words,
-    mass[...,0] = theta[...,0]
-    mass[...,1] = theta[...,0]*theta[...,1]
 
     Parameters
     ----------
@@ -57,27 +45,29 @@ def run_sim(theta: torch.Tensor, simulator: gws = default_simulator) -> torch.Te
     simulator : GravitationalWaveBenchmarkSimulator
         simulator object
 
+    domain : string
+        domain of the signal, possible values "time" or frequency
+
     Examples
     --------
     > theta
-    torch.Tensor([[20,0.5]])
-    > masses, x = run_sim(theta)
+    torch.Tensor([[20,25]])
+    > x = run_sim(theta)
     # ...
     > x.shape
-    [1,2,8192]
-    > masses
-    tensor([[20.0000,  10.0000]])
+    [1,2,2024]
 
     Returns
     -------
     LIGO spectra in batched format
     """
 
-    masses = torch.zeros_like(theta)
-    masses[...,0] = theta[...,0]
-    masses[...,1] = theta[...,1] * theta[...,0]
-    xs = simulator(masses.to("cpu"))
-    return masses, xs
+    xs = simulator(theta.to("cpu"))
+
+    signal = xs["detector"]["time"]
+    noise  = xs["noise"]["time"]
+
+    return signal + noise
 
 
 def sim_and_store(thetas: torch.Tensor,
@@ -86,7 +76,6 @@ def sim_and_store(thetas: torch.Tensor,
                   num_sims: int,
                   num_workers: int,
                   output: Path,
-                  simulator_config_file: Path,
                   message: str = ""):
     """
     perform simulations and store output in hdf5 file. This function uses
@@ -107,8 +96,6 @@ def sim_and_store(thetas: torch.Tensor,
         number of parallel workers to use
     output : Path
         path of output file
-    simulator_config_file : Path
-        location of config file for simulator
     message : str
         optional message for reproducing the simulation
 
@@ -118,7 +105,7 @@ def sim_and_store(thetas: torch.Tensor,
 
     """
     #preparing the simulator
-    simulator_ = gws(str(simulator_config_file))
+    simulator_ = gws()
     run_sim_ = partial(run_sim, simulator=simulator_)
     idx = batch_id
 
@@ -126,10 +113,9 @@ def sim_and_store(thetas: torch.Tensor,
     start = time.time()
     with multiprocessing.Pool(num_workers) as p:
         results = p.map(run_sim_, thetas)
-    #split results
-    masses, xs = zip(*results)
+
     #concat signals into one tensor
-    xs = torch.concat(xs)
+    xs = torch.concat(results)
     end1 = time.time()
 
     dur_sec = end1 - start
@@ -153,21 +139,13 @@ def sim_and_store(thetas: torch.Tensor,
             chunks=True,
             **hdf5plugin.Bitshuffle(nelems=0, cname="zstd", clevel=10),
         )
-        out5_masses = out5.create_dataset(
-            "masses",
-            data=np.asarray(masses),
-            chunks=True,
-            **hdf5plugin.Bitshuffle(nelems=0, cname="zstd", clevel=10),
-        )
 
-        out5_xs.attrs["config_file"] = config_content_str
-        out5_xs.attrs["pycbc_version"] = pycbc.__version__
+        out5_xs.attrs["bilby_version"] = bilby.__version__
         out5_xs.attrs["seed"] = seed_in_use
         if message is not None and len(message) > 0:
             out5_xs.attrs["msg"] = message
 
         out5_thetas.attrs["seed"] = seed_in_use
-        out5_masses.attrs["seed"] = seed_in_use
 
     end2 = time.time()
     dur_io_sec = end2 - end1
@@ -182,9 +160,8 @@ def sim_and_store(thetas: torch.Tensor,
 @click.option('-n', '--num_sims', default=NUM_SIMS, type=int, help='number of simulations to perform')
 @click.option('-j', '--num_workers', default=1, type=int, help='number of worker processes to use in parallel')
 @click.option('-o', '--output', default="gws-<batchindex>.h5", type=click.Path(), help='output file location, please keep <batchindex> as placeholder')
-@click.option('-s', '--simulator_config_file', default=config_path, type=click.Path(), help='path to simulator config file')
 @click.option('-m', '--message', default="", type=str, help='optional metadata message for reproducibility')
-def main(batch_id, num_sims, num_workers, output, simulator_config_file, message):
+def main(batch_id, num_sims, num_workers, output, message):
     """ will generate {NUM_SIMS} samples from simulator and store the output in a hdf5 file """
 
     idx = int(batch_id)  # Read in the first argument
@@ -212,7 +189,7 @@ def main(batch_id, num_sims, num_workers, output, simulator_config_file, message
     print(
         f"simulating batch {idx} of {num_sims} simulated samples on {num_workers} detected cores"
     )
-    value = sim_and_store(thetas, batch_id, batch_id, num_sims, num_workers, output, config_path, message)
+    value = sim_and_store(thetas, batch_id, batch_id, num_sims, num_workers, output, message)
     return value
 
 
